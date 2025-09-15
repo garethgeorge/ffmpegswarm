@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"time"
@@ -22,6 +23,10 @@ func main() {
 
 	mdnsStop := swarm.RunMdns()
 	defer mdnsStop()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go swarm.Serve(ctx)
 
 	for {
 		time.Sleep(1 * time.Second)

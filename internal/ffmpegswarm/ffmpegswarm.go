@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -36,6 +37,8 @@ import (
 )
 
 var ErrPushback = errors.New("worker pushback, try another")
+
+const addrPlaceholder = "http://ADDR_PLACEHOLDER/"
 
 // Protocol defines the libp2p protocol that we will use for the libp2p proxy
 // service that we are going to provide. This will tag the streams used for
@@ -180,32 +183,6 @@ func (f *FfmpegSwarm) PickPeer() (peer.ID, error) {
 
 // RunCommand runs a command on a remote peer, may return ErrPushback if the peer is too busy in which case the command should be retried elsewhere.
 func (f *FfmpegSwarm) RunCommand(peerID peer.ID, args []string, output io.Writer) error {
-	addr, err := netutil.AllocOpenAddr()
-	if err != nil {
-		return fmt.Errorf("failed to allocate port: %w", err)
-	}
-	server := &http.Server{
-		Addr:    addr,
-		Handler: f.createCmdMux(),
-	}
-	go func() {
-		if err := server.ListenAndServe(); err != nil {
-			log.Printf("failed to serve command: %v", err)
-		}
-	}()
-	defer server.Shutdown(context.Background())
-
-	// Spin until the server is reachable
-	for {
-		time.Sleep(time.Second)
-		log.Printf("waiting for server to be reachable at %s", addr)
-		resp, err := http.Get(fmt.Sprintf("http://%s", addr))
-		if err == nil {
-			resp.Body.Close()
-			break
-		}
-	}
-
 	replacePathLike := func(path string) (string, error) {
 		// check that it's a valid path
 		if _, err := os.Stat(path); os.IsNotExist(err) {
@@ -217,7 +194,7 @@ func (f *FfmpegSwarm) RunCommand(peerID peer.ID, args []string, output io.Writer
 
 		fileID := uuid.New().String() + filepath.Ext(path)
 		f.sharedFiles[fileID] = path
-		return fmt.Sprintf("http://%s/v1/remotefile/%s/%s", addr, f.host.ID().String(), fileID), nil
+		return fmt.Sprintf("http://%s/v1/remotefile/%s/%s", addrPlaceholder, f.host.ID().String(), fileID), nil
 	}
 
 	createUploadForPathLike := func(path string) (string, error) {
@@ -229,7 +206,7 @@ func (f *FfmpegSwarm) RunCommand(peerID peer.ID, args []string, output io.Writer
 		defer f.uploadsMu.Unlock()
 		uploadID := uuid.New().String() + filepath.Ext(path)
 		f.uploads[uploadID] = path
-		return fmt.Sprintf("http://%s/v1/remoteupload/%s", addr, f.host.ID().String(), uploadID), nil
+		return fmt.Sprintf("http://%s/v1/remoteupload/%s/%s", addrPlaceholder, f.host.ID().String(), uploadID), nil
 	}
 
 	for idx := 0; idx < len(args); idx++ {
@@ -244,6 +221,7 @@ func (f *FfmpegSwarm) RunCommand(peerID peer.ID, args []string, output io.Writer
 	}
 
 	// assume by convention that the last thing on the path is the output
+	var err error
 	args[len(args)-1], err = createUploadForPathLike(args[len(args)-1])
 	if err != nil {
 		return fmt.Errorf("upload creation failed: %w", err)
@@ -287,13 +265,21 @@ func (f *FfmpegSwarm) RunCommand(peerID peer.ID, args []string, output io.Writer
 	return nil
 }
 
-func (f *FfmpegSwarm) Serve() error {
+func (f *FfmpegSwarm) Serve(ctx context.Context) error {
 	mux := f.createMux()
 	listener, err := gsNet.Listen(f.host, Protocol)
 	if err != nil {
 		return fmt.Errorf("failed to listen on libp2p: %w", err)
 	}
-	return http.Serve(listener, mux)
+	server := &http.Server{
+		Addr:    ":0",
+		Handler: mux,
+	}
+	go func() {
+		<-ctx.Done()
+		server.Shutdown(context.Background())
+	}()
+	return server.Serve(listener)
 }
 
 // createMux provides functionality to peers
@@ -331,8 +317,42 @@ func (f *FfmpegSwarm) createMux() http.Handler {
 			f.tasksMu.Unlock()
 		}()
 
+		// Serve the worker API for this request
+		addr, err := netutil.AllocOpenAddr()
+		if err != nil {
+			http.Error(w, fmt.Errorf("failed to allocate port: %w", err).Error(), http.StatusInternalServerError)
+			return
+		}
+		server := &http.Server{
+			Addr:    addr,
+			Handler: f.createCmdMux(),
+		}
+		go func() {
+			if err := server.ListenAndServe(); err != nil {
+				log.Printf("failed to serve command: %v", err)
+			}
+		}()
+		defer server.Shutdown(context.Background())
+
+		// Spin until the server is reachable
+		for {
+			time.Sleep(time.Second)
+			log.Printf("waiting for server to be reachable at %s", addr)
+			resp, err := http.Get(fmt.Sprintf("http://%s", addr))
+			if err == nil {
+				resp.Body.Close()
+				break
+			}
+		}
+
+		args := slices.Clone(task.Args)
+		for idx := 0; idx < len(args); idx++ {
+			args[idx] = strings.ReplaceAll(args[idx], addrPlaceholder, addr)
+		}
+		log.Printf("running command: %v", args)
+
 		// Exec ffmpeg with the task arguments, and pipe the stdout and stderr to the response writer
-		cmd := exec.Command("ffmpeg", task.Args...)
+		cmd := exec.Command("ffmpeg", args...)
 		cmd.Stdout = w
 		cmd.Stderr = w
 		if err := cmd.Run(); err != nil {

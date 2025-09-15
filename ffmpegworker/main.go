@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/garethgeorge/ffmpegswarm/internal/ffmpegswarm"
@@ -21,7 +22,7 @@ func main() {
 	mdnsStop := swarm.RunMdns()
 	defer mdnsStop()
 
-	if err := swarm.Serve(); err != nil {
+	if err := swarm.Serve(context.Background()); err != nil {
 		fmt.Println("Error serving swarm worker:", err)
 	}
 	fmt.Println("Shutdown")

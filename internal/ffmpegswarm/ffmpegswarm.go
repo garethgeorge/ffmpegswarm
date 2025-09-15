@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -24,7 +25,14 @@ import (
 	gsNet "github.com/libp2p/go-libp2p-gostream"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/peerstore"
+	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
+	"github.com/libp2p/go-libp2p/p2p/security/noise"
+	tls "github.com/libp2p/go-libp2p/p2p/security/tls"
+	ma "github.com/multiformats/go-multiaddr"
 )
+
+var ErrPushback = errors.New("worker pushback, try another")
 
 // Protocol defines the libp2p protocol that we will use for the libp2p proxy
 // service that we are going to provide. This will tag the streams used for
@@ -45,12 +53,17 @@ type FfmpegSwarm struct {
 
 	uploadsMu sync.Mutex
 	uploads   map[string]string // file ID -> local disk path (for uploads)
+
+	workSlots int
 }
 
-func NewFfmpegSwarm(port int) *FfmpegSwarm {
-	host, err := libp2p.New(libp2p.ListenAddrStrings(fmt.Sprintf("/ip4/127.0.0.1/tcp/%d", port)))
+func NewFfmpegSwarm(port int) (*FfmpegSwarm, error) {
+	host, err := libp2p.New(
+		libp2p.Security(tls.ID, tls.New),
+		libp2p.Security(noise.ID, noise.New),
+	)
 	if err != nil {
-		log.Fatalln(err)
+		return nil, fmt.Errorf("create libp2p host: %w", err)
 	}
 
 	httpClient := &http.Client{
@@ -59,7 +72,7 @@ func NewFfmpegSwarm(port int) *FfmpegSwarm {
 				peerStr := strings.Split(addr, ":")[0]
 				peerID, err := peer.Decode(peerStr)
 				if err != nil {
-					return nil, fmt.Errorf("failed to decode peer ID %s: %w", peerStr, err)
+					return nil, fmt.Errorf("decode peer ID %s: %w", peerStr, err)
 				}
 				return gsNet.Dial(ctx, host, peerID, Protocol)
 			},
@@ -67,17 +80,102 @@ func NewFfmpegSwarm(port int) *FfmpegSwarm {
 	}
 
 	return &FfmpegSwarm{
-		host:       host,
-		httpClient: httpClient,
+		host:        host,
+		httpClient:  httpClient,
+		workSlots:   1,
+		tasks:       make(map[string]*Task),
+		sharedFiles: make(map[string]string),
+		uploads:     make(map[string]string),
+	}, nil
+}
+
+func (f *FfmpegSwarm) SetWorkSlots(workSlots int) {
+	f.workSlots = workSlots
+}
+
+func (f *FfmpegSwarm) RunMdns() func() {
+	mdnsService := mdns.NewMdnsService(f.host, "ffmpegswarm", &discoveryNotifee{h: f.host})
+	mdnsService.Start()
+	return func() {
+		mdnsService.Close()
 	}
 }
 
-func (f *FfmpegSwarm) PickPeer() peer.ID {
-	// pick a peer at random
-	peers := f.host.Peerstore().Peers()
-	return peers[rand.Intn(len(peers))]
+func (f *FfmpegSwarm) AddPeerToPeerstore(addr string) error {
+	peeraddr, err := ma.NewMultiaddr(addr)
+	if err != nil {
+		return fmt.Errorf("parse multiaddr %q: %w", addr, err)
+	}
+	pidStr, err := peeraddr.ValueForProtocol(ma.P_P2P)
+	if err != nil {
+		return fmt.Errorf("create peer ID from multiaddr %q: %w", addr, err)
+	}
+	peerID, err := peer.Decode(pidStr)
+	if err != nil {
+		return fmt.Errorf("decode peer ID %s: %w", pidStr, err)
+	}
+	f.host.Peerstore().AddAddr(peerID, peeraddr, peerstore.PermanentAddrTTL)
+	return nil
 }
 
+func (f *FfmpegSwarm) Addresses() []string {
+	addresses := make([]string, 0, len(f.host.Addrs()))
+	for _, a := range f.host.Addrs() {
+		addresses = append(addresses, fmt.Sprintf("%s/p2p/%s", a, f.host.ID()))
+	}
+	return addresses
+}
+
+func (f *FfmpegSwarm) PickPeer() (peer.ID, error) {
+	peers := f.host.Peerstore().Peers()
+	resultChan := make(chan peer.ID, len(peers))
+	var wg sync.WaitGroup
+	wg.Add(len(peers))
+	for _, peerID := range peers {
+		go func(peerID peer.ID) {
+			defer wg.Done()
+			if peerID == f.host.ID() {
+				return
+			}
+
+			resp, err := f.httpClient.Get(fmt.Sprintf("http://%s/v1/info", peerID.String()))
+			if err != nil {
+				fmt.Printf("Error getting info from peer %s: %v\n", peerID, err)
+				return
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusOK {
+				fmt.Printf("Error getting info from peer %s: %v\n", peerID, resp.Status)
+				return
+			}
+
+			var workerState WorkerState
+			if err := json.NewDecoder(resp.Body).Decode(&workerState); err != nil {
+				fmt.Printf("Error decoding info from peer %s: %v\n", peerID, err)
+				return
+			}
+
+			if workerState.WorkSlots > workerState.TaskCount {
+				resultChan <- peerID
+			}
+		}(peerID)
+	}
+	wg.Wait()
+	close(resultChan)
+
+	var options []peer.ID
+	for peerID := range resultChan {
+		options = append(options, peerID)
+	}
+	if len(options) == 0 {
+		return "", fmt.Errorf("no available peers")
+	}
+
+	return options[rand.Intn(len(options))], nil
+}
+
+// RunCommand runs a command on a remote peer, may return ErrPushback if the peer is too busy in which case the command should be retried elsewhere.
 func (f *FfmpegSwarm) RunCommand(peerID peer.ID, args []string, output io.Writer) error {
 	replacePathLike := func(path string) (string, error) {
 		// check that it's a valid path
@@ -123,6 +221,8 @@ func (f *FfmpegSwarm) RunCommand(peerID peer.ID, args []string, output io.Writer
 		return fmt.Errorf("upload creation failed: %w", err)
 	}
 
+	log.Printf("Running command on peer %s: %v", peerID, args)
+
 	task := Task{
 		ID:   uuid.New().String(),
 		Args: args,
@@ -150,6 +250,9 @@ func (f *FfmpegSwarm) RunCommand(peerID peer.ID, args []string, output io.Writer
 	}
 
 	if resp.StatusCode != http.StatusOK {
+		if resp.StatusCode == http.StatusServiceUnavailable {
+			return ErrPushback
+		}
 		return fmt.Errorf("failed to send task: %s", resp.Status)
 	}
 
@@ -168,11 +271,14 @@ func (f *FfmpegSwarm) Serve() error {
 func (f *FfmpegSwarm) createMux() http.Handler {
 	r := chi.NewRouter()
 
-	r.Get("/v1/tasks", func(w http.ResponseWriter, r *http.Request) {
+	r.Get("/v1/info", func(w http.ResponseWriter, r *http.Request) {
 		f.tasksMu.Lock()
 		defer f.tasksMu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(f.tasks)
+		json.NewEncoder(w).Encode(WorkerState{
+			WorkSlots: f.workSlots,
+			TaskCount: len(f.tasks),
+		})
 	})
 
 	r.Post("/v1/command", func(w http.ResponseWriter, r *http.Request) {
@@ -182,6 +288,12 @@ func (f *FfmpegSwarm) createMux() http.Handler {
 			return
 		}
 		f.tasksMu.Lock()
+		if len(f.tasks) >= f.workSlots {
+			f.tasksMu.Unlock()
+			http.Error(w, "too many tasks", http.StatusServiceUnavailable)
+			return
+		}
+
 		f.tasks[task.ID] = &task
 		f.tasksMu.Unlock()
 		defer func() {
@@ -312,7 +424,27 @@ func (f *FfmpegSwarm) createMux() http.Handler {
 	return r
 }
 
+type WorkerState struct {
+	WorkSlots int `json:"work_slots"`
+	TaskCount int `json:"task_count"`
+}
+
 type Task struct {
 	ID   string   `json:"id"`
 	Args []string `json:"args"`
+}
+
+// discoveryNotifee is a struct to be passed to mdns.NewMdnsService,
+// and implements the mdns.Notifee interface.
+type discoveryNotifee struct {
+	h host.Host
+}
+
+// HandlePeerFound is called when a new peer is found via mDNS.
+func (n *discoveryNotifee) HandlePeerFound(p peer.AddrInfo) {
+	err := n.h.Connect(context.Background(), p)
+	if err != nil {
+		fmt.Printf("Discovered new peer but couldn't connect %s: %v\n", p.ID, err)
+	}
+	fmt.Printf("Connected to new peer: %s\n", p.ID)
 }

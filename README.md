@@ -8,12 +8,12 @@ Worker discovery is currently implemented for LAN using mDNS. Clients will autom
 
 1. Run 1 or more ffmpegworkers:
 ```sh
-ffmpegworker --work-slots 2
+ffmpegswarm worker --work-slots 2
 ```
 
 2. Execute a job
 ```sh
-ffmpegclient -i input.mkv -c:v libx264 -t 120 output.mkv
+ffmpegswarm ffmpeg -i input.mkv -c:v libx264 -t 120 output.mkv
 ```
 
 ## Future Work

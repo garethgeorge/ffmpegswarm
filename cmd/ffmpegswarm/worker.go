@@ -2,24 +2,34 @@ package main
 
 import (
 	"context"
-	"flag"
 	"fmt"
 
 	"github.com/garethgeorge/ffmpegswarm/internal/ffmpegswarm"
+	"github.com/spf13/cobra"
 )
 
 var (
-	workSlotsFlag = flag.Int("work-slots", 1, "Number of work slots for this worker")
+	workSlots int
 )
 
-func main() {
-	flag.Parse()
+var workerCmd = &cobra.Command{
+	Use:   "worker",
+	Short: "Run the ffmpegswarm worker",
+	Run:   runWorker,
+}
+
+func init() {
+	workerCmd.Flags().IntVarP(&workSlots, "work-slots", "n", 1, "Number of work slots for this worker")
+	rootCmd.AddCommand(workerCmd)
+}
+
+func runWorker(cmd *cobra.Command, args []string) {
 	swarm, err := ffmpegswarm.NewFfmpegSwarm(0)
 	if err != nil {
 		fmt.Println("Error creating swarm worker:", err)
 		return
 	}
-	swarm.SetWorkSlots(*workSlotsFlag)
+	swarm.SetWorkSlots(workSlots)
 	fmt.Println("Swarm worker listening on:")
 	for _, addr := range swarm.Addresses() {
 		fmt.Printf("\t- %s\n", addr)

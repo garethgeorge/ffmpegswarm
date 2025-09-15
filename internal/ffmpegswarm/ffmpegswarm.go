@@ -134,6 +134,9 @@ func (f *FfmpegSwarm) Addresses() []string {
 }
 
 func (f *FfmpegSwarm) PickPeer() (peer.ID, error) {
+	reqCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
 	peers := f.host.Peerstore().Peers()
 	resultChan := make(chan peer.ID, len(peers))
 	var wg sync.WaitGroup
@@ -145,7 +148,12 @@ func (f *FfmpegSwarm) PickPeer() (peer.ID, error) {
 				return
 			}
 
-			resp, err := f.httpClient.Get(fmt.Sprintf("http://%s/v1/info", peerID.String()))
+			req, err := http.NewRequestWithContext(reqCtx, "GET", fmt.Sprintf("http://%s/v1/info", peerID.String()), nil)
+			if err != nil {
+				fmt.Printf("Error creating request for peer %s: %v\n", peerID, err)
+				return
+			}
+			resp, err := f.httpClient.Do(req)
 			if err != nil {
 				fmt.Printf("Error getting info from peer %s: %v\n", peerID, err)
 				return

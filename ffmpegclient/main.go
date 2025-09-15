@@ -39,7 +39,7 @@ func main() {
 				continue
 			}
 			fmt.Println("Error running command:", err)
-			return
 		}
+		return
 	}
 }

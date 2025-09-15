@@ -22,6 +22,7 @@ import (
 
 	// We need to import libp2p's libraries that we use in this project.
 
+	"github.com/garethgeorge/ffmpegswarm/internal/ioutil"
 	"github.com/garethgeorge/ffmpegswarm/internal/netutil"
 	chi "github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -38,7 +39,7 @@ import (
 
 var ErrPushback = errors.New("worker pushback, try another")
 
-const addrPlaceholder = "http://ADDR_PLACEHOLDER/"
+const addrPlaceholder = "[ADDR_PLACEHOLDER]"
 
 // Protocol defines the libp2p protocol that we will use for the libp2p proxy
 // service that we are going to provide. This will tag the streams used for
@@ -328,7 +329,7 @@ func (f *FfmpegSwarm) createMux() http.Handler {
 			Handler: f.createCmdMux(),
 		}
 		go func() {
-			if err := server.ListenAndServe(); err != nil {
+			if err := server.ListenAndServe(); err != http.ErrServerClosed {
 				log.Printf("failed to serve command: %v", err)
 			}
 		}()
@@ -345,6 +346,7 @@ func (f *FfmpegSwarm) createMux() http.Handler {
 			}
 		}
 
+		// Substitute the address into the command to be executed
 		args := slices.Clone(task.Args)
 		for idx := 0; idx < len(args); idx++ {
 			args[idx] = strings.ReplaceAll(args[idx], addrPlaceholder, addr)
@@ -352,14 +354,31 @@ func (f *FfmpegSwarm) createMux() http.Handler {
 		log.Printf("running command: %v", args)
 
 		// Exec ffmpeg with the task arguments, and pipe the stdout and stderr to the response writer
-		cmd := exec.Command("ffmpeg", args...)
-		cmd.Stdout = w
-		cmd.Stderr = w
+		cmd := exec.CommandContext(r.Context(), "ffmpeg", args...)
+
+		tsrw := &ioutil.ThreadSafeResponseWriter{W: w}
+		cmd.Stdout = tsrw
+		cmd.Stderr = tsrw
+
+		ctx, cancel := context.WithCancel(r.Context())
+		defer cancel()
+		ticker := time.NewTicker(time.Second * 1)
+		defer ticker.Stop()
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					tsrw.Flush()
+				}
+			}
+		}()
 		if err := cmd.Run(); err != nil {
-			http.Error(w, fmt.Errorf("failed to run ffmpeg: %w", err).Error(), http.StatusInternalServerError)
+			log.Printf("ffmpeg failed: %v", err)
 			return
 		}
-		w.WriteHeader(http.StatusOK)
+		log.Printf("ffmpeg completed successfully")
 	})
 
 	r.Get("/v1/file/{id}", func(w http.ResponseWriter, r *http.Request) {
@@ -410,7 +429,8 @@ func (f *FfmpegSwarm) createMux() http.Handler {
 		}
 	})
 
-	r.Put("/v1/upload/{id}", func(w http.ResponseWriter, r *http.Request) {
+	r.Post("/v1/upload/{id}", func(w http.ResponseWriter, r *http.Request) {
+		log.Printf("receiving uploaded file %s from peer %s", chi.URLParam(r, "id"), r.RemoteAddr)
 		fileID := chi.URLParam(r, "id")
 		if fileID == "" {
 			http.Error(w, "missing file 'id' parameter", http.StatusBadRequest)
@@ -457,15 +477,15 @@ func (f *FfmpegSwarm) createCmdMux() http.Handler {
 
 		req, err := http.NewRequestWithContext(r.Context(), "GET", remoteURL, nil)
 		if err != nil {
-			log.Printf("Failed to create request for peer %s: %v", peer, err)
-			http.Error(w, "Failed to create internal request", http.StatusInternalServerError)
+			log.Printf("failed to create request for peer %s: %v", peer, err)
+			http.Error(w, "failed to create internal request", http.StatusInternalServerError)
 			return
 		}
 
 		resp, err := f.httpClient.Do(req)
 		if err != nil {
-			log.Printf("Failed to send request to peer %s: %v", peer, err)
-			http.Error(w, fmt.Sprintf("Failed to send request to peer %s", peer), http.StatusServiceUnavailable)
+			log.Printf("failed to /v1/file request to peer %s: %v", peer, err)
+			http.Error(w, fmt.Sprintf("failed to /v1/file request to peer %s", peer), http.StatusServiceUnavailable)
 			return
 		}
 		defer resp.Body.Close()
@@ -479,25 +499,26 @@ func (f *FfmpegSwarm) createCmdMux() http.Handler {
 		io.Copy(w, resp.Body)
 	})
 
-	r.Put("/v1/remoteupload/{id}", func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("uploading a remote file %s from peer %s for a local ffmpeg process", chi.URLParam(r, "id"), r.RemoteAddr)
+	r.Post("/v1/remoteupload/{peer}/{id}", func(w http.ResponseWriter, r *http.Request) {
+		log.Printf("uploading file %s from peer %s for a local ffmpeg process", chi.URLParam(r, "id"), chi.URLParam(r, "peer"))
+		peer := chi.URLParam(r, "peer")
 		id := chi.URLParam(r, "id")
 		if id == "" {
 			http.Error(w, "missing file 'id' parameter", http.StatusBadRequest)
 			return
 		}
 
-		remoteURL := fmt.Sprintf("http://%s/v1/upload/%s", r.RemoteAddr, id)
-		req, err := http.NewRequestWithContext(r.Context(), "PUT", remoteURL, r.Body)
+		remoteURL := fmt.Sprintf("http://%s/v1/upload/%s", peer, id)
+		req, err := http.NewRequestWithContext(context.Background(), "POST", remoteURL, r.Body)
 		if err != nil {
-			log.Printf("Failed to create request for peer %s: %v", r.RemoteAddr, err)
-			http.Error(w, "Failed to create internal request", http.StatusInternalServerError)
+			log.Printf("failed to create request for peer %s: %v", peer, err)
+			http.Error(w, "failed to create internal request", http.StatusInternalServerError)
 			return
 		}
 		resp, err := f.httpClient.Do(req)
 		if err != nil {
-			log.Printf("Failed to send request to peer %s: %v", r.RemoteAddr, err)
-			http.Error(w, fmt.Sprintf("Failed to send request to peer %s", r.RemoteAddr), http.StatusServiceUnavailable)
+			log.Printf("failed to send /v1/upload request to peer %s: %v", peer, err)
+			http.Error(w, fmt.Sprintf("failed to send /v1/upload request to peer %s", peer), http.StatusServiceUnavailable)
 			return
 		}
 		defer resp.Body.Close()

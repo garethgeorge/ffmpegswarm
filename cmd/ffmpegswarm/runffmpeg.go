@@ -11,9 +11,11 @@ import (
 )
 
 var clientCmd = &cobra.Command{
-	Use:   "ffmpeg",
-	Short: "Run ffmpeg on a remote worker",
-	Run:   runClient,
+	Use:                "ffmpeg <args>",
+	Short:              "Run ffmpeg on a remote worker, <args> are passed directly to ffmpeg",
+	Run:                runClient,
+	Args:               cobra.MinimumNArgs(1),
+	DisableFlagParsing: true,
 }
 
 func init() {

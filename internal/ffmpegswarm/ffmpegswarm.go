@@ -23,7 +23,6 @@ import (
 	// We need to import libp2p's libraries that we use in this project.
 
 	"github.com/garethgeorge/ffmpegswarm/internal/ioutil"
-	"github.com/garethgeorge/ffmpegswarm/internal/netutil"
 	chi "github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/libp2p/go-libp2p"
@@ -35,6 +34,7 @@ import (
 	"github.com/libp2p/go-libp2p/p2p/security/noise"
 	tls "github.com/libp2p/go-libp2p/p2p/security/tls"
 	ma "github.com/multiformats/go-multiaddr"
+	"golang.org/x/sync/errgroup"
 )
 
 var ErrPushback = errors.New("worker pushback, try another")
@@ -52,14 +52,14 @@ type FfmpegSwarm struct {
 
 	httpClient *http.Client
 
+	cmdServerAddrCv    sync.Cond
+	cmdServerAddrValue string
+
 	tasksMu sync.Mutex
 	tasks   map[string]*Task
 
 	sharedFilesMu sync.Mutex
 	sharedFiles   map[string]string // file ID -> local disk path
-
-	uploadsMu sync.Mutex
-	uploads   map[string]string // file ID -> local disk path (for uploads)
 
 	workSlots int
 }
@@ -86,14 +86,17 @@ func NewFfmpegSwarm(port int) (*FfmpegSwarm, error) {
 		},
 	}
 
-	return &FfmpegSwarm{
+	swarm := &FfmpegSwarm{
 		host:        host,
 		httpClient:  httpClient,
 		workSlots:   1,
 		tasks:       make(map[string]*Task),
 		sharedFiles: make(map[string]string),
-		uploads:     make(map[string]string),
-	}, nil
+		cmdServerAddrCv: sync.Cond{
+			L: &sync.Mutex{},
+		},
+	}
+	return swarm, nil
 }
 
 func (f *FfmpegSwarm) SetWorkSlots(workSlots int) {
@@ -192,18 +195,17 @@ func (f *FfmpegSwarm) PickPeer() (peer.ID, error) {
 
 // RunCommand runs a command on a remote peer, may return ErrPushback if the peer is too busy in which case the command should be retried elsewhere.
 func (f *FfmpegSwarm) RunCommand(peerID peer.ID, args []string, output io.Writer) error {
+	if len(args) < 1 {
+		return fmt.Errorf("must provide at least 1 argument to ffmpeg")
+	}
+
 	replacePathLike := func(path string) (string, error) {
 		// check that it's a valid path
 		if _, err := os.Stat(path); os.IsNotExist(err) {
 			return "", fmt.Errorf("path %s does not exist", path)
 		}
 
-		f.sharedFilesMu.Lock()
-		defer f.sharedFilesMu.Unlock()
-
-		fileID := uuid.New().String() + filepath.Ext(path)
-		f.sharedFiles[fileID] = path
-		return fmt.Sprintf("http://%s/v1/remotefile/%s/%s", addrPlaceholder, f.host.ID().String(), fileID), nil
+		return fmt.Sprintf("http://%s/v1/remotefile/%s/%s", addrPlaceholder, f.host.ID().String(), f.addSharedFile(path)), nil
 	}
 
 	createUploadForPathLike := func(path string) (string, error) {
@@ -211,11 +213,7 @@ func (f *FfmpegSwarm) RunCommand(peerID peer.ID, args []string, output io.Writer
 		if _, err := os.Stat(path); !os.IsNotExist(err) {
 			return "", fmt.Errorf("path %s already exists or is not accessible", path)
 		}
-		f.uploadsMu.Lock()
-		defer f.uploadsMu.Unlock()
-		uploadID := uuid.New().String() + filepath.Ext(path)
-		f.uploads[uploadID] = path
-		return fmt.Sprintf("http://%s/v1/remoteupload/%s/%s", addrPlaceholder, f.host.ID().String(), uploadID), nil
+		return fmt.Sprintf("http://%s/v1/remoteupload/%s/%s", addrPlaceholder, f.host.ID().String(), f.addSharedFile(path)), nil
 	}
 
 	for idx := 0; idx < len(args); idx++ {
@@ -275,24 +273,95 @@ func (f *FfmpegSwarm) RunCommand(peerID peer.ID, args []string, output io.Writer
 }
 
 func (f *FfmpegSwarm) Serve(ctx context.Context) error {
-	mux := f.createMux()
-	listener, err := gsNet.Listen(f.host, Protocol)
-	if err != nil {
-		return fmt.Errorf("failed to listen on libp2p: %w", err)
+	var eg errgroup.Group
+	eg.Go(func() error {
+		mux := f.createPeerMux()
+		server := &http.Server{
+			Addr:    ":0",
+			Handler: mux,
+		}
+		listener, err := gsNet.Listen(f.host, Protocol)
+		if err != nil {
+			return fmt.Errorf("failed to listen on libp2p: %w", err)
+		}
+		eg.Go(func() error {
+			<-ctx.Done()
+			return server.Shutdown(context.Background())
+		})
+		return server.Serve(listener)
+	})
+
+	eg.Go(func() error {
+		mux := f.createCmdMux()
+		server := &http.Server{
+			Addr:    ":0",
+			Handler: mux,
+		}
+		listener, err := net.Listen("tcp", ":0")
+		if err != nil {
+			return fmt.Errorf("failed to listen on tcp: %w", err)
+		}
+		server.Addr = listener.Addr().String()
+		eg.Go(func() error {
+			<-ctx.Done()
+			return server.Shutdown(context.Background())
+		})
+		eg.Go(func() error {
+			// Spin until the server is reachable
+			start := time.Now()
+			for {
+				if time.Since(start) > 2*time.Second {
+					return fmt.Errorf("timed out waiting for ffmpeg command api server to be reachable")
+				}
+				time.Sleep(50 * time.Millisecond)
+				resp, err := http.Get(fmt.Sprintf("http://%s", server.Addr))
+				if err == nil {
+					resp.Body.Close()
+					break
+				}
+			}
+			f.cmdServerAddrCv.L.Lock()
+			f.cmdServerAddrValue = server.Addr
+			f.cmdServerAddrCv.L.Unlock()
+			f.cmdServerAddrCv.Broadcast()
+			return nil
+		})
+
+		return server.Serve(listener)
+	})
+
+	return eg.Wait()
+}
+
+func (f *FfmpegSwarm) getCmdServerAddr() string {
+	f.cmdServerAddrCv.L.Lock()
+	defer f.cmdServerAddrCv.L.Unlock()
+	for f.cmdServerAddrValue == "" {
+		f.cmdServerAddrCv.Wait()
 	}
-	server := &http.Server{
-		Addr:    ":0",
-		Handler: mux,
+	return f.cmdServerAddrValue
+}
+
+func (f *FfmpegSwarm) addSharedFile(fpath string) string {
+	f.sharedFilesMu.Lock()
+	defer f.sharedFilesMu.Unlock()
+	fid := uuid.New().String() + filepath.Ext(fpath)
+	f.sharedFiles[fid] = fpath
+	return fid
+}
+
+func (f *FfmpegSwarm) getSharedFile(fid string) string {
+	f.sharedFilesMu.Lock()
+	defer f.sharedFilesMu.Unlock()
+	fpath, ok := f.sharedFiles[fid]
+	if !ok {
+		return ""
 	}
-	go func() {
-		<-ctx.Done()
-		server.Shutdown(context.Background())
-	}()
-	return server.Serve(listener)
+	return fpath
 }
 
 // createMux provides functionality to peers
-func (f *FfmpegSwarm) createMux() http.Handler {
+func (f *FfmpegSwarm) createPeerMux() http.Handler {
 	r := chi.NewRouter()
 
 	r.Get("/v1/info", func(w http.ResponseWriter, r *http.Request) {
@@ -326,38 +395,10 @@ func (f *FfmpegSwarm) createMux() http.Handler {
 			f.tasksMu.Unlock()
 		}()
 
-		// Serve the worker API for this request
-		addr, err := netutil.AllocOpenAddr()
-		if err != nil {
-			http.Error(w, fmt.Errorf("failed to allocate port: %w", err).Error(), http.StatusInternalServerError)
-			return
-		}
-		server := &http.Server{
-			Addr:    addr,
-			Handler: f.createCmdMux(),
-		}
-		go func() {
-			if err := server.ListenAndServe(); err != http.ErrServerClosed {
-				log.Printf("failed to serve command: %v", err)
-			}
-		}()
-		defer server.Shutdown(context.Background())
-
-		// Spin until the server is reachable
-		for {
-			time.Sleep(time.Second)
-			log.Printf("waiting for server to be reachable at %s", addr)
-			resp, err := http.Get(fmt.Sprintf("http://%s", addr))
-			if err == nil {
-				resp.Body.Close()
-				break
-			}
-		}
-
 		// Substitute the address into the command to be executed
 		args := slices.Clone(task.Args)
 		for idx := 0; idx < len(args); idx++ {
-			args[idx] = strings.ReplaceAll(args[idx], addrPlaceholder, addr)
+			args[idx] = strings.ReplaceAll(args[idx], addrPlaceholder, f.getCmdServerAddr())
 		}
 		log.Printf("running command: %v", args)
 
@@ -397,11 +438,8 @@ func (f *FfmpegSwarm) createMux() http.Handler {
 			return
 		}
 
-		f.sharedFilesMu.Lock()
-		filePath, exists := f.sharedFiles[fileID]
-		f.sharedFilesMu.Unlock()
-
-		if !exists {
+		filePath := f.getSharedFile(fileID)
+		if filePath == "" {
 			http.Error(w, "file not found", http.StatusNotFound)
 			return
 		}
@@ -446,8 +484,8 @@ func (f *FfmpegSwarm) createMux() http.Handler {
 		}
 
 		// require an upload exists
-		uploadPath, exists := f.uploads[fileID]
-		if !exists {
+		uploadPath := f.getSharedFile(fileID)
+		if uploadPath == "" {
 			http.Error(w, "upload not found", http.StatusNotFound)
 			return
 		}

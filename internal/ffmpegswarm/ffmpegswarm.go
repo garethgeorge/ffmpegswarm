@@ -1,6 +1,7 @@
 package ffmpegswarm
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -468,10 +469,15 @@ func (f *FfmpegSwarm) createPeerMux() http.Handler {
 		w.Header().Set("Content-Type", mimeType)
 		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s", filepath.Base(filePath)))
 
-		// Copy file contents to response
-		_, err = io.Copy(w, file)
+		// Copy file contents to response with buffered writer
+		bufWriter := bufio.NewWriterSize(w, 32*1024) // 32KB buffer
+		_, err = io.Copy(bufWriter, file)
 		if err != nil {
 			log.Printf("Error serving file %s: %v", filePath, err)
+			return
+		}
+		if err = bufWriter.Flush(); err != nil {
+			log.Printf("Error flushing buffer for file %s: %v", filePath, err)
 		}
 	})
 
@@ -490,7 +496,7 @@ func (f *FfmpegSwarm) createPeerMux() http.Handler {
 			return
 		}
 
-		// write the file to disk
+		// write the file to disk with buffered writer
 		file, err := os.Create(uploadPath)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("failed to create file: %v", err), http.StatusInternalServerError)
@@ -498,9 +504,14 @@ func (f *FfmpegSwarm) createPeerMux() http.Handler {
 		}
 		defer file.Close()
 
-		_, err = io.Copy(file, r.Body)
+		bufWriter := bufio.NewWriterSize(file, 32*1024) // 32KB buffer
+		_, err = io.Copy(bufWriter, r.Body)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("failed to write file: %v", err), http.StatusInternalServerError)
+			return
+		}
+		if err = bufWriter.Flush(); err != nil {
+			http.Error(w, fmt.Sprintf("failed to flush file buffer: %v", err), http.StatusInternalServerError)
 			return
 		}
 	})
@@ -542,7 +553,10 @@ func (f *FfmpegSwarm) createCmdMux() http.Handler {
 			}
 		}
 		w.WriteHeader(resp.StatusCode)
-		io.Copy(w, resp.Body)
+		// Use buffered writer for response proxying
+		bufWriter := bufio.NewWriterSize(w, 32*1024) // 32KB buffer
+		io.Copy(bufWriter, resp.Body)
+		bufWriter.Flush()
 	})
 
 	r.Post("/v1/remoteupload/{peer}/{id}", func(w http.ResponseWriter, r *http.Request) {
@@ -569,7 +583,10 @@ func (f *FfmpegSwarm) createCmdMux() http.Handler {
 		}
 		defer resp.Body.Close()
 		w.WriteHeader(resp.StatusCode)
-		io.Copy(w, resp.Body)
+		// Use buffered writer for upload response proxying
+		bufWriter := bufio.NewWriterSize(w, 32*1024) // 32KB buffer
+		io.Copy(bufWriter, resp.Body)
+		bufWriter.Flush()
 	})
 
 	return r

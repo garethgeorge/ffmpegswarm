@@ -413,7 +413,7 @@ func (f *FfmpegSwarm) createPeerMux() http.Handler {
 
 		tsrw := &ioutil.ThreadSafeResponseWriter{W: w}
 		var output io.Writer = tsrw
-		if f.workSlots > 1 {
+		if f.workSlots <= 1 {
 			output = io.MultiWriter(output, os.Stdout)
 		}
 		cmd.Stdout = output

@@ -1,4 +1,15 @@
-FROM ubuntu AS ffmpeg-builder
+
+FROM golang:1.24-alpine AS app-builder
+
+WORKDIR /app
+COPY go.* ./
+RUN go mod download
+COPY . .
+RUN go build -o ffmpegswarm -ldflags "-s -w" ./cmd/ffmpegswarm
+
+CMD ["./ffmpegswarm"]
+
+FROM ubuntu AS builder
 
 # Compile and install fresh ffmpeg from sources:
 # See: https://trac.ffmpeg.org/wiki/CompilationGuide/Ubuntu
@@ -62,18 +73,34 @@ RUN mkdir -p ~/ffmpeg_sources ~/bin && cd ~/ffmpeg_sources && \
 
 RUN mv ~/bin/ffmpeg /usr/local/bin && mv ~/bin/ffprobe /usr/local/bin && mv ~/bin/ffplay /usr/local/bin
 
-FROM golang:1.23-alpine AS app-builder
-
-WORKDIR /app
-COPY go.* ./
-RUN go mod download
-COPY . .
-RUN go build -o ffmpegswarm main.go
-
-FROM alpine AS app
-
-WORKDIR /bin
-COPY --from=ffmpeg-builder /usr/local/bin/ffmpeg /usr/local/bin/ffprobe /usr/local/bin/ffplay /usr/local/bin/
 COPY --from=app-builder /app/ffmpegswarm /bin/
 
-CMD ["./ffmpegswarm"]
+FROM ubuntu:24.04 AS ffmpegswarm
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+  libass-dev \
+  libfreetype6-dev \
+  libsdl2-dev \
+  libtool \
+  libva-dev \
+  libvdpau-dev \
+  libvorbis-dev \
+  libxcb1-dev \
+  libxcb-shm0-dev \
+  libxcb-xfixes0-dev \
+  zlib1g-dev \
+  libx265-dev \
+  libnuma-dev \
+  libvpx-dev \
+  libmp3lame-dev \
+  libopus-dev \
+  libx264-dev \
+  libfdk-aac-dev \
+  libsvtav1-dev libsvtav1enc-dev libsvtav1dec-dev \
+  ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /usr/local/bin/ffmpeg /usr/local/bin/ffprobe /usr/local/bin/ffplay /usr/local/bin/
+COPY --from=app-builder /app/ffmpegswarm /bin/
+
+CMD ["ffmpegswarm"]

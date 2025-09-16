@@ -8,12 +8,24 @@ Worker discovery is currently implemented for LAN using mDNS. Clients will autom
 
 1. Run 1 or more ffmpegworkers:
 ```sh
-ffmpegswarm worker --work-slots 2
+ffmpegswarm worker --work-slots 2 --addrs /ip4/127.0.0.1/tcp/54993
 ```
 
 2. Execute a job
 ```sh
-ffmpegswarm ffmpeg -i input.mkv -c:v libx264 -t 120 output.mkv
+docker run -e FFMPEGSWARM_PEERS=/ip4/172.17.0.2/tcp/8080/p2p/12D3KooWMSpWhuC9mgpdfrenzEmcgAiCVViwCuZ3GnNbiGxsptCF -it garethgeorge/ffmpegswarm ffmpegswarm ffmpeg -i input.mkv -c:v libx264 -t 120 output.mkv
+```
+
+## Docker Usage
+
+1. Run 1 or more ffmpegworkers:
+```sh
+docker run -p 8080 -it garethgeorge/ffmpegswarm ffmpegswarm --addrs=/ip4/0.0.0.0/tcp/8080 worker
+```
+
+2. Execute a job
+```sh
+
 ```
 
 ## Future Work

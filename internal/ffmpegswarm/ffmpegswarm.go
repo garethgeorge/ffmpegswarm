@@ -33,7 +33,6 @@ import (
 	"github.com/libp2p/go-libp2p/core/peerstore"
 	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
 	"github.com/libp2p/go-libp2p/p2p/security/noise"
-	tls "github.com/libp2p/go-libp2p/p2p/security/tls"
 	ma "github.com/multiformats/go-multiaddr"
 	"golang.org/x/sync/errgroup"
 )
@@ -65,11 +64,17 @@ type FfmpegSwarm struct {
 	workSlots int
 }
 
-func NewFfmpegSwarm(port int) (*FfmpegSwarm, error) {
-	host, err := libp2p.New(
-		libp2p.Security(tls.ID, tls.New),
+func NewFfmpegSwarm(addrs []string) (*FfmpegSwarm, error) {
+	options := []libp2p.Option{
+		libp2p.ProtocolVersion(Protocol),
 		libp2p.Security(noise.ID, noise.New),
-	)
+	}
+	if len(addrs) > 0 {
+		options = append(options, libp2p.ListenAddrStrings(addrs...))
+	} else {
+		options = append(options, libp2p.NoListenAddrs)
+	}
+	host, err := libp2p.New(options...)
 	if err != nil {
 		return nil, fmt.Errorf("create libp2p host: %w", err)
 	}
@@ -407,8 +412,12 @@ func (f *FfmpegSwarm) createPeerMux() http.Handler {
 		cmd := exec.CommandContext(r.Context(), "ffmpeg", args...)
 
 		tsrw := &ioutil.ThreadSafeResponseWriter{W: w}
-		cmd.Stdout = tsrw
-		cmd.Stderr = tsrw
+		var output io.Writer = tsrw
+		if f.workSlots > 1 {
+			output = io.MultiWriter(output, os.Stdout)
+		}
+		cmd.Stdout = output
+		cmd.Stderr = output
 
 		ctx, cancel := context.WithCancel(r.Context())
 		defer cancel()

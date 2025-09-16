@@ -23,7 +23,7 @@ func init() {
 }
 
 func runClient(cmd *cobra.Command, args []string) {
-	swarm, err := ffmpegswarm.NewFfmpegSwarm(0)
+	swarm, err := ffmpegswarm.NewFfmpegSwarm([]string{})
 	if err != nil {
 		fmt.Println("Error creating swarm worker:", err)
 		return
@@ -34,9 +34,7 @@ func runClient(cmd *cobra.Command, args []string) {
 		fmt.Printf("\t- %s\n", addr)
 	}
 
-	mdnsStop := swarm.RunMdns()
-	defer mdnsStop()
-
+	addPeers(swarm)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go swarm.Serve(ctx)

@@ -10,6 +10,7 @@ import (
 
 var (
 	workSlots int
+	addrs     []string
 )
 
 var workerCmd = &cobra.Command{
@@ -20,11 +21,12 @@ var workerCmd = &cobra.Command{
 
 func init() {
 	workerCmd.Flags().IntVarP(&workSlots, "work-slots", "n", 1, "Number of work slots for this worker")
+	workerCmd.Flags().StringSliceVarP(&addrs, "addrs", "a", []string{"/ip4/0.0.0.0/tcp/0", "/ip6/::/tcp/0"}, "Addresses to listen on")
 	rootCmd.AddCommand(workerCmd)
 }
 
 func runWorker(cmd *cobra.Command, args []string) {
-	swarm, err := ffmpegswarm.NewFfmpegSwarm(0)
+	swarm, err := ffmpegswarm.NewFfmpegSwarm(addrs)
 	if err != nil {
 		fmt.Println("Error creating swarm worker:", err)
 		return
@@ -35,9 +37,7 @@ func runWorker(cmd *cobra.Command, args []string) {
 		fmt.Printf("\t- %s\n", addr)
 	}
 
-	mdnsStop := swarm.RunMdns()
-	defer mdnsStop()
-
+	addPeers(swarm)
 	if err := swarm.Serve(context.Background()); err != nil {
 		fmt.Println("Error serving swarm worker:", err)
 	}
